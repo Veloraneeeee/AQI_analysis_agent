@@ -1,10 +1,13 @@
 # 用户上传一份天气事件表和一份 AQI 表；Agent 自动识别关键字段，请用户确认；
 # 用户选择一种天气事件后，Agent 比较该事件开始当天和结束当天的 AQI，并总结整体升降趋势。
+from dataclasses import field
 
 import pandas as pd
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from pathlib import Path
+
+from pandas.core.interchange import column
 from typing_extensions import TypedDict, Required
 from openpyxl import load_workbook
 
@@ -23,17 +26,19 @@ class AnalysisState(TypedDict):
     aqi_file_preview: str
 
     # identity_column 和用户确认所产生的
-    column_mapping: dict[str, str]
+    column_mapping: dict[str, str | list[str] | None]
     user_confirmed: bool
     confirmation_feedback: str
 
     # extract_event_types 和 select_event_type 产生
     available_event_types: set[str]
-    selected_event_type: str
+    select_event_type: str
 
     # validate_data 产生
     validation_error: str | None
     is_valid: bool
+    validation_issue: str | None
+    final_report: str
 
 @tool # 识别文件以及数据
 def inspect_table(file_path)->str:
@@ -179,7 +184,7 @@ def ask_for_confirmation(state: AnalysisState)->dict:
         "column_mapping":state["column_mapping"],
         "instruction":(
             "如果正确，请回复正确"
-            "如需更改，请说明错误字段，并且告知争取的列名"
+            "如需更改，请说明错误字段，并且告知正确的列名"
         )
     })
 
@@ -207,6 +212,7 @@ def ask_for_confirmation(state: AnalysisState)->dict:
 
 # 条件边
 from typing import Literal
+
 def route_confirmation(
         state: AnalysisState
 )->Literal["extract_event_types","revise_columns"]:
@@ -215,7 +221,7 @@ def route_confirmation(
 
     return "revise_columns"
 
-# 需要修改，revise_columns边
+# 需要修改的：revise_columns边
 def revise_columns(state: AnalysisState)->dict:
     structured_llm = llm.with_structured_output(ColumnMapping)
 
@@ -240,7 +246,7 @@ def revise_columns(state: AnalysisState)->dict:
         "user_confirmed": False,
     }
 
-# 确认后的，提取的
+# 确认后的，提取的noded
 def extract_event_types(
         state: AnalysisState
 )->dict[str, set[str]] | None:
@@ -256,5 +262,506 @@ def extract_event_types(
         "event_type_column": event_type_column,
     })
     return {
-        "available_event_types": available_event_types.model_dump(),
+        "available_event_types": available_event_types,
     }
+
+def select_event_type(
+        state: AnalysisState
+) -> dict[str, str]:
+    available_event_types = sorted(state["available_event_types"]) # 提取集合
+
+    user_selection = interrupt({
+        "message":"请选择一种天气",
+        "available_event_types":available_event_types,
+    })
+    return {
+        "select_event_type": str(user_selection).strip(),
+    }
+
+
+def validate_data(
+        state: AnalysisState
+)->dict:
+    # 用户选择的事件类型是否存在于可选集合中。
+    select_event_type = state["select_event_type"]
+    available_event_types = state["available_event_types"]
+    column_mapping = state["column_mapping"]
+
+    try:
+        if select_event_type not in available_event_types:
+            raise ValueError(
+                f'找不到事件类型 f{select_event_type}'
+            )
+
+        # LLM 是否识别出了分析需要的所有字段
+        required_fields = [
+                "event_type",
+                "start_time",
+                "end_time",
+                "event_state",
+                "event_county",
+                "aqi_date",
+                "aqi_value",
+                "monitor_state",
+                "monitor_county",
+                "monitor_site_id",
+                "event_location_type",
+            ]
+
+        # 找出没有被成功识别的字段
+        missing_fields = []
+        for i in required_fields:
+            if i not in column_mapping.get(i):
+                missing_fields.append(i)
+
+        if missing_fields:
+            raise ValueError(
+                 f"缺少必要字段 :{missing_fields}"
+            )
+
+        return {
+            "is_valid": True,
+            "validation_error": None,
+            "validation_issue": None,
+        }
+
+    except (KeyError, ValueError) as error: # KeyError对应这个node最开始的selected_event_type etc.
+        return {
+            "is_valid": False,
+            "validation_error": str(error),
+            "validation_issue": "missing_columns"
+        }
+
+def route_validation( # 条件边不更新节点，只是返回下一站的名字
+        state: AnalysisState
+)->Literal[
+    "select_event_type",
+    "explain_missing_data",
+    "match_and_calculate",
+]:
+    if state["is_valid"]:
+        return "match_and_calculate"
+
+    if state["validation_issue"]=="invalid_event_type":
+        return "select_event_type"
+
+    return "explain_missing_data"
+
+def explain_missing_data(
+    state: AnalysisState
+)-> dict[str, str]:
+    error_message = state["validation_error"]
+    report = (
+        "目前无法继续分析。\n"
+        f"原因：{error_message}\n"
+        "请检查上传的文件是否包含需要的字段"
+    )
+    return {
+        "final_report": report,
+    }
+
+def match_and_calculate(state: AnalysisState)->dict:
+    event_file_path = state["event_file_path"]
+    aqi_file_path = state["aqi_file_path"]
+    column_mapping = state["column_mapping"]
+    select_event_type = state["select_event_type"]
+
+    aqi_changes = list[dict]
+
+    monitor_site_columns = column_mapping["monitor_site_id"]
+    if not isinstance(monitor_site_columns, list):
+        raise ValueError(
+            "monitor_site_id 应包含列的列表。."
+        )
+    aqi_columns = [
+        column_mapping["aqi_date"],
+        column_mapping["aqi_value"],
+        column_mapping["monitor_state"],
+        column_mapping["monitor_county"],
+    ] + monitor_site_columns
+    aqi_columns = list(dict.fromkeys(aqi_columns))
+
+    aqi_data = read_table(
+        aqi_file_path,
+        aqi_columns,
+    )
+
+    event_columns = [
+        column_mapping["event_type"],
+        column_mapping["start_time"],
+        column_mapping["end_time"],
+        column_mapping["event_state"],
+        column_mapping["event_county"],
+        column_mapping["event_location_type"],
+    ]
+
+    if not all(
+        isinstance(column, str)
+        for column in event_columns
+    ):
+        raise ValueError(
+            "天气事件文件的必要列没有被正确识别。"
+        )
+
+    event_columns = [
+        column
+        for column in event_columns
+        if isinstance(column, str)
+    ]
+
+    event_data = read_table(
+        event_file_path,
+        event_columns,
+    )
+
+    event_type_column = column_mapping["event_type"]
+
+    if not isinstance(event_type_column, str):
+        raise ValueError(
+            "event_type 没有对应到有效的列名。"
+        )
+
+    selected_events = event_data[
+        event_data[event_type_column]
+        .astype(str)
+        .str.strip()
+        == select_event_type
+        ].copy()
+
+    if selected_events.empty:
+        raise ValueError(
+            f"没有找到事件类型：{select_event_type}"
+        )
+
+
+    start_time_column = column_mapping["start_time"]
+    end_time_column = column_mapping["end_time"]
+
+    if not isinstance(start_time_column, str):
+        raise ValueError(
+            "start_time 没有对应到有效的列名。"
+        )
+
+    if not isinstance(end_time_column, str):
+        raise ValueError(
+            "end_time 没有对应到有效的列名。"
+        )
+
+    selected_events["_start_date"] = pd.to_datetime(
+        selected_events[start_time_column],
+        errors="coerce",
+    ).dt.normalize()
+
+    selected_events["_end_date"] = pd.to_datetime(
+        selected_events[end_time_column],
+        errors="coerce",
+    ).dt.normalize()
+
+    selected_events = selected_events.dropna(
+        subset=["_start_date", "_end_date"]
+    )
+
+    if selected_events.empty:
+        raise ValueError(
+            "所选事件没有可用的开始和结束日期。"
+        )
+
+    event_location_type_column = column_mapping[
+        "event_location_type"
+    ]
+
+    if not isinstance(event_location_type_column, str):
+        raise ValueError(
+            "event_location_type 没有对应到有效的列名。"
+        )
+
+    selected_events = selected_events[
+        selected_events[event_location_type_column]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        == "C"
+        ].copy()
+
+    if selected_events.empty:
+        raise ValueError(
+            "所选事件没有可以按县匹配的记录。"
+        )
+
+    aqi_date_column = column_mapping["aqi_date"]
+    aqi_value_column = column_mapping["aqi_value"]
+
+    if not isinstance(aqi_date_column, str):
+        raise ValueError(
+            "aqi_date 没有对应到有效的列名。"
+        )
+
+    if not isinstance(aqi_value_column, str):
+        raise ValueError(
+            "aqi_value 没有对应到有效的列名。"
+        )
+
+    aqi_data["_aqi_date"] = pd.to_datetime(
+        aqi_data[aqi_date_column],
+        errors="coerce",
+    ).dt.normalize()
+
+    aqi_data["_aqi_value"] = pd.to_numeric(
+        aqi_data[aqi_value_column],
+        errors="coerce",
+    )
+
+    aqi_data = aqi_data.dropna(
+        subset=["_aqi_date", "_aqi_value"]
+    )
+
+    if aqi_data.empty:
+        raise ValueError(
+            "AQI 文件中没有可用的日期和 AQI 数值。"
+        )
+
+    event_location_type: str | None = Field(
+        description=(
+            "Column indicating whether the event location is a county "
+            "or another geographic zone, such as CZ_TYPE"
+        )
+    )
+
+    event_state_column = column_mapping["event_state"]
+    event_county_column = column_mapping["event_county"]
+    monitor_state_column = column_mapping["monitor_state"]
+    monitor_county_column = column_mapping["monitor_county"]
+
+    location_columns = [
+        event_state_column,
+        event_county_column,
+        monitor_state_column,
+        monitor_county_column,
+    ]
+
+    if not all(
+            isinstance(column, str)
+            for column in location_columns
+    ):
+        raise ValueError(
+            "州或县字段没有被正确识别。"
+        )
+
+    selected_events["_state_code"] = normalize_fips(
+        selected_events[event_state_column],
+        width=2,
+    )
+
+    selected_events["_county_code"] = normalize_fips(
+        selected_events[event_county_column],
+        width=3,
+    )
+
+    aqi_data["_state_code"] = normalize_fips(
+        aqi_data[monitor_state_column],
+        width=2,
+    )
+
+    aqi_data["_county_code"] = normalize_fips(
+        aqi_data[monitor_county_column],
+        width=3,
+    )
+
+    selected_events = selected_events.dropna(
+        subset=["_state_code", "_county_code"]
+    )
+
+    aqi_data = aqi_data.dropna(
+        subset=["_state_code", "_county_code"]
+    )
+
+    aqi_data["_monitor_site_id"] = (
+        aqi_data[monitor_site_columns]
+        .astype("string")
+        .fillna("")
+        .agg("|".join, axis=1)
+    )
+
+    daily_aqi = (
+        aqi_data
+        .groupby(
+            [
+                "_state_code",
+                "_county_code",
+                "_monitor_site_id",
+                "_aqi_date",
+            ],
+            as_index=False,
+        )["_aqi_value"]
+        .median()
+    )
+
+    selected_events = selected_events.reset_index(drop=True)
+    selected_events["_event_row_id"] = selected_events.index
+
+    start_matches = selected_events.merge(
+        daily_aqi,
+        left_on=[
+            "_state_code",
+            "_county_code",
+            "_start_date",
+        ],
+        right_on=[
+            "_state_code",
+            "_county_code",
+            "_aqi_date",
+        ],
+        how="inner",
+    )
+
+    start_matches = start_matches.rename(
+        columns={
+            "_aqi_value": "start_aqi",
+        }
+    )
+
+    start_matches = start_matches.drop(
+        columns=["_aqi_date"]
+    )
+
+    if start_matches.empty:
+        raise ValueError(
+            "没有找到事件开始当天对应的 AQI 记录。"
+        )
+
+    end_aqi_data = daily_aqi.rename(
+        columns={
+            "_aqi_date": "_end_aqi_date",
+            "_aqi_value": "end_aqi",
+        }
+    )
+
+    matched_events = start_matches.merge(
+        end_aqi_data,
+        left_on=[
+            "_state_code",
+            "_county_code",
+            "_monitor_site_id",
+            "_end_date",
+        ],
+        right_on=[
+            "_state_code",
+            "_county_code",
+            "_monitor_site_id",
+            "_end_aqi_date",
+        ],
+        how="inner",
+    )
+
+    matched_events = matched_events.drop(
+        columns=["_end_aqi_date"]
+    )
+
+    if matched_events.empty:
+        raise ValueError(
+            "没有找到同一监测站在事件开始和结束当天的完整 AQI 记录。"
+        )
+
+    matched_events["aqi_change"] = (
+            matched_events["end_aqi"]
+            - matched_events["start_aqi"]
+    )
+
+    # 给每条结果添加趋势
+    matched_events["trend"] = (
+        matched_events["aqi_change"]
+        .apply(classify_trend)
+    )
+    #创建统一的输出字段
+    matched_events["event_type"] = select_event_type
+
+    matched_events["start_date"] = (
+        matched_events["_start_date"]
+        .dt.strftime("%Y-%m-%d")
+    )
+
+    matched_events["end_date"] = (
+        matched_events["_end_date"]
+        .dt.strftime("%Y-%m-%d")
+    )
+
+    # 只保留最终需要的数据
+    result_columns = [
+        "_event_row_id",
+        "event_type",
+        "_state_code",
+        "_county_code",
+        "_monitor_site_id",
+        "start_date",
+        "end_date",
+        "start_aqi",
+        "end_aqi",
+        "aqi_change",
+        "trend",
+    ]
+    # 转换成 list[dict】
+    aqi_changes = (
+        matched_events[result_columns]
+        .rename(
+            columns={
+                "_event_row_id": "event_id",
+                "_state_code": "state_code",
+                "_county_code": "county_code",
+                "_monitor_site_id": "monitor_site_id",
+            }
+        )
+        .to_dict(orient="records")
+    )
+
+    return {
+        "aqi_changes": aqi_changes,
+    }
+
+def read_table(
+    file_path: str,
+    columns: list[str],
+) -> pd.DataFrame:
+    path = Path(file_path)
+
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(
+            path,
+            usecols=columns,
+        )
+
+    if path.suffix.lower() == ".xlsx":
+        return pd.read_excel(
+            path,
+            usecols=columns,
+        )
+
+    raise ValueError(
+        f"Unsupported file type: {path.suffix}"
+    )
+
+# 统一州和县代码的格式
+def normalize_fips(
+    values: pd.Series,
+    width: int,
+) -> pd.Series:
+    numeric_values = pd.to_numeric(
+        values,
+        errors="coerce",
+    )
+
+    return (
+        numeric_values
+        .astype("Int64")
+        .astype("string")
+        .str.zfill(width)
+    )
+
+# 定义升降判断
+def classify_trend(aqi_change: float) -> str:
+    if aqi_change > 0:
+        return "increased"
+
+    if aqi_change < 0:
+        return "decreased"
+
+    return "unchanged"
