@@ -1,12 +1,19 @@
-# 用户上传一份天气事件表和一份 AQI 表；Agent 自动识别关键字段，请用户确认；
-# 用户选择一种天气事件后，Agent 比较该事件开始当天和结束当天的 AQI，并总结整体升降趋势。
-from dataclasses import field
+from typing import Annotated
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+from pydantic import BaseModel, Field
 
 from pprint import pprint
 import pandas as pd
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from pathlib import Path
+
+from langchain_core.messages import SystemMessage,HumanMessage, AIMessage
+
+from uuid import uuid4 # 给每个对象生成一个几乎不会重复的 ID
+from langchain_core.messages import HumanMessage
 
 # from pandas.core.interchange import column
 from typing import TypedDict, Required, Literal
@@ -18,11 +25,100 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 
 llm = ChatOllama(
-    model = "qwen3:4b",
-    temperature = 0
+    model="qwen3:1.7b", # 回答概念问题、进行普通对话
+    temperature=0,
+    reasoning=False, # 关闭这个模型的“思考模式”，让它直接生成回答
 )
 
+context_llm = ChatOllama( # 理解用户要怎样修改研究条件，输出结构化操作
+    model="qwen3:4b",
+    temperature=0,
+    reasoning=False,
+)
+
+class ResearchContext(BaseModel):
+    region: str | None = Field(
+        default=None,
+        description="用户指定的研究地区；未指定时为 None。",
+    )
+
+    year: int | None = Field(
+        default=None,
+        description="用户指定的研究年份；未指定时为 None。",
+    )
+
+    event_description: str | None = Field(
+        default=None,
+        description="用户描述的天气事件，如暴雨。",
+    )
+
+    pollutant: str | None = Field(
+        default=None,
+        description="用户指定的污染物，如臭氧。",
+    )
+
+class ResearchFieldChange(BaseModel):
+    field: Literal[
+        "region",
+        "year",
+        "event_description",
+        "pollutant",
+    ]
+
+    operation: Literal[
+        "set",
+        "clear",
+        "restore_first",
+    ]
+
+    value: str | int | None
+
+
+class ResearchAction(BaseModel):
+    changes: list[ResearchFieldChange]
+
+    answer_request: str | None = Field(
+        description=(
+            "除修改条件外，本轮还需回答的问题或执行的请求。"
+            "只修改条件时为 None；"
+            "混合请求保留附带问题，不要回答它。"
+        ),
+    )
+
+class ResearchContextUpdate(BaseModel):
+    updates: ResearchContext = Field(
+        default_factory=ResearchContext,
+        description=(
+            "只填写用户本轮明确新增或修改的研究条件。"
+            "未修改的字段保持 None。"
+        ),
+    )
+
+    clear_fields: list[
+        Literal["region", "year", "event_description", "pollutant"]
+    ] = Field(
+        default_factory=list,
+        description=(
+            "只有用户明确要求取消某个研究条件时，"
+            "才填入对应字段名。普通提问返回空列表。"
+        ),
+    )
+
+    clear_evidence: str | None = Field(
+        default=None,
+        description=(
+            "用户明确要求取消研究条件的原话片段，"
+            "必须逐字来自最新用户消息。"
+            "没有明确取消要求时为 None。"
+            "题外话、先不分析、概念提问都不是取消要求。"
+        ),
+    )
+
 class AnalysisState(TypedDict, total=False):
+
+    messages: Annotated[list[BaseMessage], add_messages] # 保存用户和助手的对话，聊天记录
+    research_context: dict[str, str | int | None] # 把研究条件保存在图的会话状态里，当前生效的研究条件
+    research_history: list[dict[str, str | int | None]] # 过去保存过的条件快照
 
     # 用户启用Agent时必须提供
     event_file_path: Required[str]
@@ -52,6 +148,7 @@ class AnalysisState(TypedDict, total=False):
 
     # summarize_results
     trend_summary: dict
+
 @tool # 识别文件以及数据
 def inspect_table(file_path)->str:
     """Users会给你一个或者一些文件，这些文件大概率都是csv和xlsx的文件。
@@ -127,9 +224,6 @@ def inspect_files(state: AnalysisState) -> dict[str, str]:
         "event_file_preview": event_type_preview,
         "aqi_file_preview": aqi_preview
     }
-
-
-from pydantic import BaseModel, Field
 
 # 要让LLM查看之前的event_type_preview和aqi_preview，先定义LLM 的结构化输出
 class ColumnMapping(BaseModel):
@@ -402,11 +496,12 @@ def explain_missing_data(
         "final_report": report,
     }
 
-def match_and_calculate(state: AnalysisState)->dict:
-    event_file_path = state["event_file_path"]
-    aqi_file_path = state["aqi_file_path"]
-    column_mapping = state["column_mapping"]
-    select_event_type = state["selected_event_type"]
+def analyze_event_aqi(
+    event_file_path: str,
+    aqi_file_path: str,
+    column_mapping: dict[str, str | list[str] | None],
+    select_event_type: str,
+) -> list[dict]:
 
     # 列出AQI文件需要读取的字段
     monitor_site_columns = column_mapping["monitor_site_id"]
@@ -792,6 +887,17 @@ def match_and_calculate(state: AnalysisState)->dict:
     )
 
     # 最后保持 node 的返回值：
+    return aqi_changes
+
+
+def match_and_calculate(state: AnalysisState) -> dict:
+    aqi_changes = analyze_event_aqi(
+        event_file_path=state["event_file_path"],
+        aqi_file_path=state["aqi_file_path"],
+        column_mapping=state["column_mapping"],
+        select_event_type=state["selected_event_type"],
+    )
+
     return {
         "aqi_changes": aqi_changes,
     }
@@ -983,6 +1089,248 @@ def generate_report(
         "final_report": report,
     }
 
+
+def chat_with_user(state: AnalysisState) -> dict:
+    current_context = ResearchContext.model_validate(
+        state.get("research_context", {})  # 先取出保存的条件。第一次聊天时还没有，就得到空字典 {}。
+    ) # 按照 ResearchContext 的格式进行校验，并生成一个对象。
+
+    context_instruction = SystemMessage(
+        content=(
+                """
+    解析最新用户消息，返回 changes 和 answer_request。
+
+    changes 是研究条件操作列表。
+    answer_request 是需要另外回答的问题或处理的请求。
+
+    只修改条件时 answer_request=null。
+    既修改又提问时，两者都填写。
+    普通问答或闲聊时 changes=[]，
+    answer_request 保留用户的问题或消息。
+
+    不要把“先不分析”当作待执行的分析请求。
+    没有明确修改要求时，changes=[]。
+    假设问题中明确说先别修改，也不修改。
+
+    操作规则：
+    set：明确设置新值，value 填新值，年份用整数。
+    clear：明确取消条件，value=null。
+    restore_first：恢复最初指定值，value=null，由程序查历史。
+
+    field 只能是：
+    region：地区
+    year：年份
+    event_description：天气事件
+    pollutant：污染物
+
+    只修改明确要求的字段。
+    “先不分析”仍允许保存已指定条件。
+    需要完整提取本轮给出的条件，不得遗漏事件或污染物。
+
+    例：研究得州2024年的暴雨与臭氧AQI，先不分析。
+    {"changes":[{"field":"region","operation":"set","value":"得州"},{"field":"year","operation":"set","value":2024},{"field":"event_description","operation":"set","value":"暴雨"},{"field":"pollutant","operation":"set","value":"臭氧"}],"answer_request":null}
+
+    例：改成2023年
+    {"changes":[{"field":"year","operation":"set","value":2023}],"answer_request":null}
+
+    例：把年份改成2023年，顺便解释一下AQI是什么。
+    {"changes":[{"field":"year","operation":"set","value":2023}],"answer_request":"解释一下AQI是什么。"}
+
+    例：取消年份限制，解释一下臭氧是什么。
+    {"changes":[{"field":"year","operation":"clear","value":null}],"answer_request":"解释一下臭氧是什么。"}
+
+    例：把年份改回最开始那个年份
+    {"changes":[{"field":"year","operation":"restore_first","value":null}],"answer_request":null}
+
+    例：AQI是什么意思？
+    {"changes":[],"answer_request":"AQI是什么意思？"}
+
+    例：你妈妈不喜欢你
+    {"changes":[],"answer_request":"你妈妈不喜欢你"}
+    """
+                + "\n当前条件："
+                + current_context.model_dump_json()
+        )
+    )
+
+    context_model = context_llm.with_structured_output(
+        ResearchAction
+    )
+
+    action = context_model.invoke(
+        [context_instruction, state["messages"][-1]]
+    )
+
+    merged_context = current_context.model_dump()
+    update_notes = []
+
+    for change in action.changes:
+        field_name = change.field
+
+        if change.operation == "set":
+            if change.value is None:
+                update_notes.append(
+                    f"{field_name} 没有提供新值，保留原条件。"
+                )
+                continue
+
+            if field_name == "year":
+                valid_value = type(change.value) is int
+            else:
+                valid_value = (
+                    isinstance(change.value, str)
+                    and change.value.strip() != ""
+                )
+
+            if valid_value is False:
+                update_notes.append(
+                    f"{field_name} 的新值格式无效，保留原条件。"
+                )
+                continue
+
+            merged_context[field_name] = change.value
+
+        elif change.operation == "clear":
+            merged_context[field_name] = None
+
+        elif change.operation == "restore_first":
+            for snapshot in state.get("research_history", []):
+                historical_value = snapshot.get(field_name)
+
+                if historical_value is not None:
+                    merged_context[field_name] = historical_value
+                    break
+            else:
+                update_notes.append(
+                    f"没有找到 {field_name} 最初指定的历史值，"
+                    "未执行恢复。"
+                )
+
+    updated_context = ResearchContext.model_validate(
+        merged_context # 本轮合并修改后的字典，再校验一次
+    )
+
+    research_history = [
+        snapshot.copy()
+        for snapshot in state.get("research_history", [])
+    ]
+
+    previous_snapshot = current_context.model_dump()
+    current_snapshot = updated_context.model_dump()
+
+    if current_snapshot != previous_snapshot:
+        if not research_history and any(
+            value is not None
+            for value in previous_snapshot.values()
+        ):
+            research_history.append(previous_snapshot.copy())
+
+        research_history.append(current_snapshot.copy())
+
+    answer_instruction = SystemMessage(
+        content=(
+            "你是一名面向研究者的天气与空气质量分析助手。"
+            "请使用中文自然、简洁地回答，并结合对话理解追问。\n"
+            "程序为本轮整理的研究条件是：\n"
+            f"{updated_context.model_dump_json()}\n"
+            f"本轮操作提示：{update_notes}\n"
+            "描述当前研究条件时，以程序提供的条件为准，"
+            "不要用聊天历史里的旧值代替。"
+            "操作提示说明未执行成功时，不得声称操作已完成。"
+            "如果这些条件与用户的明确要求冲突，请指出问题。"
+            "关键条件有歧义时，提出简短澄清问题。"
+            "当前尚未接入数据查询、计算和联网工具。"
+            "可以解释一般概念，但不能声称已经查询数据、"
+            "完成计算或获取最新信息，也不能编造分析数字。"
+            "不必每轮重复介绍能力限制。"
+            "用户询问概念时，直接解释概念，"
+            "不要强行联系当前研究，也不要添加未经验证的天气与污染关系。"
+            "用户说先不分析时，简短确认保存的条件即可。"
+            "项目已有内置历史数据，不要默认要求用户上传或提供数据。"
+            "目前工具尚未接入；用户要求实际计算时，"
+            "如实说明分析功能仍在接入，不要把功能缺失说成用户缺少数据。只提取最新一条用户消息要求的研究条件变更。"
+            "已有条件是当前状态，历史对话只用于理解最新消息中的指代。"
+            "例如，用户先指定2024年，后来改为2023年，"
+            "最新消息说“改回最开始那个年份”，应该把年份更新为2024。"
+            "不要把历史中的要求重新执行。"
+            "最新消息只是询问概念时，不修改任何研究条件。"
+            "无法确定指代时，不猜测、不修改对应字段。"
+            "只有确实缺少完成任务所必需的信息时才追问，"
+            "不要每轮都以问题或索要更多信息结尾。"
+        )
+    )
+
+    changed_fields = [
+        field_name
+        for field_name in current_snapshot
+        if current_snapshot[field_name] != previous_snapshot[field_name]
+    ]
+
+    field_labels = {
+        "region": "地区",
+        "year": "年份",
+        "event_description": "天气事件",
+        "pollutant": "污染物",
+    }
+
+    reply_parts = []
+
+    for field_name in changed_fields:
+        value = current_snapshot[field_name]
+        label = field_labels[field_name]
+
+        if value is None:
+            reply_parts.append(f"{label}限制已取消。")
+        else:
+            reply_parts.append(f"{label}已设为：{value}。")
+
+    reply_parts.extend(update_notes)
+
+    if action.changes and not changed_fields and not update_notes:
+        reply_parts.append(
+            "研究条件与当前设置一致，未发生变化。"
+        )
+
+    answer_request = action.answer_request
+
+    if answer_request is not None and answer_request.strip() != "":
+        question_instruction = SystemMessage(
+            content=(
+                    answer_instruction.content
+                    + "\n条件操作的确认由程序单独提供。"
+                      "本次只回答用户的附带问题，不重复确认条件，"
+                      "也不要声称执行了新的条件修改。"
+            )
+        )
+
+        answer = llm.invoke(
+            [
+                question_instruction,
+                *state.get("messages", [])[:-1],
+                HumanMessage(content=answer_request),
+            ]
+        )
+
+        reply_parts.append(str(answer.content))
+
+    if not reply_parts:
+        answer = llm.invoke(
+            [answer_instruction, *state.get("messages", [])]
+        )
+        reply_parts.append(str(answer.content))
+
+    response = AIMessage(
+        content="\n\n".join(reply_parts)
+    )
+
+    return {
+        "messages": [response],
+        "research_context": current_snapshot,
+        "research_history": research_history,
+    }
+
+
+
 # 终于要连图了！！耶耶耶
 builder = StateGraph(
     state_schema=AnalysisState,
@@ -1001,7 +1349,8 @@ builder.add_node("generate_report",     generate_report,)
 
 builder.add_edge(
     START,
-    "inspect_files")
+    "extract_event_types",
+)
 
 builder.add_edge(
     "inspect_files",
@@ -1056,64 +1405,54 @@ builder.add_edge(
     "generate_report",
     END)
 
-checkpointer = InMemorySaver()
 
-graph = builder.compile(
-    checkpointer=checkpointer,
+
+analysis_graph = builder.compile(
+    checkpointer=InMemorySaver(),
+)
+
+chat_builder = StateGraph(AnalysisState)
+chat_builder.add_node("chat_with_user", chat_with_user)
+
+chat_builder.add_edge(START, "chat_with_user")
+chat_builder.add_edge("chat_with_user", END)
+
+graph = chat_builder.compile(
+    checkpointer=InMemorySaver(),
 )
 
 # 第一次invoke
 if __name__ == "__main__":
-    config={
-        "configurable":{
-            "thread_id":"aqi-analysis-1",
+    config = {
+        "configurable": {
+            "thread_id": str(uuid4()),
         }
     }
-    initial_state = {
-        "event_file_path": (
-            "/Users/velorane/Desktop/"
-            "StormEvents_Combined_Fixed.xlsx"
-        ),
-        "aqi_file_path": (
-            "/Users/velorane/26 spring/STAT605-project/"
-            "final/data/combined_daily_44201_2023_2025.csv"
-        ),
-    }
 
-    result = graph.invoke(
-        initial_state,
-        config=config,
-    )
+    print("天气与空气质量助手已启动。输入“退出”结束。")
 
-    while "__interrupt__" in result:
-        interrupt_request = result["__interrupt__"][0].value
+    while True:
+        user_input = input("\n你：").strip()
 
-        print("\nAgent 已暂停，请处理下面的请求：")
-        pprint(
-            interrupt_request,
-            width=100,
-            sort_dicts=False,
-        )
+        if user_input.lower() in {"退出", "exit", "quit", "0"}:
+            print("本次对话结束。")
+            break
 
-        user_response = input(
-            "\n请输入你的回复："
-        ).strip()
+        if user_input == " ":
+            continue # 跳过本轮后面的代码，回到循环开头。这样就不会把空消息发给模型。
 
         result = graph.invoke(
-            Command(resume=user_response),
+            {
+                "messages": [
+                    HumanMessage(content=user_input),
+                ],
+            },
             config=config,
         )
 
-    print("\nAgent 已完成运行。")
+        print("\n助手：", result["messages"][-1].content)
+        print("\n当前研究条件：")
+        pprint(result.get("research_context", {}))
 
-    if "final_report" in result:
-        print(result["final_report"])
-    else:
-        print(result)
-
-    if interrupt:
-        print("\nAgent 已暂停，请处理下面的请求：")
-        print(interrupt[0].value)
-
-    else:
-        print(result)
+        print("\n研究条件历史：")
+        pprint(result.get("research_history", []))
