@@ -24,6 +24,8 @@ from langgraph.types import interrupt, Command
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 
+from analysis_graph import build_analysis_graph
+
 llm = ChatOllama(
     model="qwen3:1.7b", # 回答概念问题、进行普通对话
     temperature=0,
@@ -63,19 +65,22 @@ class ResearchFieldChange(BaseModel):
         "year",
         "event_description",
         "pollutant",
-    ]
+    ] # field 是改哪个条件？
 
     operation: Literal[
         "set",
         "clear",
         "restore_first",
-    ]
+    ] # operation 是怎么改
+    # set：设置新值。
+    # clear：取消条件。
+    # restore_first：恢复最初指定的值。
 
-    value: str | int | None
+    value: str | int | None # value是设置成什么
 
 
 class ResearchAction(BaseModel):
-    changes: list[ResearchFieldChange]
+    changes: list[ResearchFieldChange] # 可能一个问题里多个修改条件
 
     answer_request: str | None = Field(
         description=(
@@ -1090,10 +1095,25 @@ def generate_report(
     }
 
 
+
+    # 以user说的：当前研究2024年，用户说：“把年份改成2023年，顺便解释一下AQI是什么。” 为例子
 def chat_with_user(state: AnalysisState) -> dict:
+    #负责处理用户的一轮输入：理解要求、更新研究条件、组织回答，再把结果交回图保存。
+
+    # state AnalysisState 里已经有：
+    # - messages：包含本轮用户消息的聊天记录。
+    # - research_context：上一轮保存的研究条件。
+    # - research_history：过去的条件快照。
+
+    # 这个函数只处理一轮。外面的 while True 负责不断接收下一句话。
+
+    # 读取旧研究条件
     current_context = ResearchContext.model_validate(
         state.get("research_context", {})  # 先取出保存的条件。第一次聊天时还没有，就得到空字典 {}。
     ) # 按照 ResearchContext 的格式进行校验，并生成一个对象。
+
+    # 读到这里的旧年份是 2024。model_validate() 按照我们定义的格式校验数据，
+    # 这里的 current_context，后面一直代表本轮修改前的条件。
 
     context_instruction = SystemMessage(
         content=(
@@ -1153,21 +1173,35 @@ def chat_with_user(state: AnalysisState) -> dict:
         )
     )
 
-    context_model = context_llm.with_structured_output(
+    context_model = context_llm.with_structured_output( # 调用4b模型，理解本轮要求
         ResearchAction
     )
-
     action = context_model.invoke(
-        [context_instruction, state["messages"][-1]]
+        [context_instruction, state["messages"][-1]] # 最新用户消息
     )
+    # 读到这里期望得到：
+    # {
+    #   "changes": [
+    #     {
+    #       "field": "year",
+    #       "operation": "set",
+    #       "value": 2023
+    #     }
+    #   ],
+    #   "answer_request": "解释一下AQI是什么。"
+    # }
+    # 这一步只理解要求，还没有实际修改条件。
 
+    # Python 执行条件操作
     merged_context = current_context.model_dump()
-    update_notes = []
+    update_notes = [] # 遇到无效值或找不到历史时，把原因放进 update_notes
+    # 例子这里最终执行 merged_context["year"] = 2023
 
-    for change in action.changes:
+    for change in action.changes:  # 根据ResearchFieldChange里面定义的 field_name 修改研究条件字典中的对应项
+        # changes对应 class RA
         field_name = change.field
 
-        if change.operation == "set":
+        if change.operation == "set": # 检查新值格式，再更新指定字段
             if change.value is None:
                 update_notes.append(
                     f"{field_name} 没有提供新值，保留原条件。"
@@ -1190,10 +1224,10 @@ def chat_with_user(state: AnalysisState) -> dict:
 
             merged_context[field_name] = change.value
 
-        elif change.operation == "clear":
+        elif change.operation == "clear": # 把指定字段设为 None
             merged_context[field_name] = None
 
-        elif change.operation == "restore_first":
+        elif change.operation == "restore_first": # 从历史中查找该字段最初的非空值
             for snapshot in state.get("research_history", []):
                 historical_value = snapshot.get(field_name)
 
@@ -1206,6 +1240,7 @@ def chat_with_user(state: AnalysisState) -> dict:
                     "未执行恢复。"
                 )
 
+    # 校验新条件，并记录变化历史
     updated_context = ResearchContext.model_validate(
         merged_context # 本轮合并修改后的字典，再校验一次
     )
@@ -1215,10 +1250,22 @@ def chat_with_user(state: AnalysisState) -> dict:
         for snapshot in state.get("research_history", [])
     ]
 
+    # 得到前后两份快照：
     previous_snapshot = current_context.model_dump()
+    # current_context：这一轮开始时读取的研究条件。
+    # .model_dump()：把 Pydantic 对象转换成普通 Python 字典。
+    # previous_snapshot：保存修改前的那份字典。
     current_snapshot = updated_context.model_dump()
+    # updated_context：处理用户本轮要求后得到的条件。
+    # current_snapshot：保存修改后的字典。
+
+    # previous_snapshot：年份2024
+    # current_snapshot：年份2023
+
+    # 两者不同，就把新快照 2023 加入 research_history
 
     if current_snapshot != previous_snapshot:
+        # 研究条件确实改变了，才记录一条新的历史快照。
         if not research_history and any(
             value is not None
             for value in previous_snapshot.values()
@@ -1260,11 +1307,14 @@ def chat_with_user(state: AnalysisState) -> dict:
         )
     )
 
+    # 根据真实变化生成确认文字
     changed_fields = [
+        # 找出本轮具体改变了哪些字段
         field_name
         for field_name in current_snapshot
         if current_snapshot[field_name] != previous_snapshot[field_name]
     ]
+    # 例子这里得到["year"]
 
     field_labels = {
         "region": "地区",
@@ -1273,7 +1323,9 @@ def chat_with_user(state: AnalysisState) -> dict:
         "pollutant": "污染物",
     }
 
-    reply_parts = []
+    # 接着 Python 从 current_snapshot 取出新值，生成：
+    reply_parts = [] # 准备一个列表，收集本轮回复内容
+    # reply_parts = ["年份已设为：2023。"]
 
     for field_name in changed_fields:
         value = current_snapshot[field_name]
@@ -1291,6 +1343,7 @@ def chat_with_user(state: AnalysisState) -> dict:
             "研究条件与当前设置一致，未发生变化。"
         )
 
+    # 有问题时，调用1.7b模型回答
     answer_request = action.answer_request
 
     if answer_request is not None and answer_request.strip() != "":
@@ -1303,6 +1356,7 @@ def chat_with_user(state: AnalysisState) -> dict:
             )
         )
 
+        # 例子的问题这里本轮有附带问题，所以进入：
         answer = llm.invoke(
             [
                 question_instruction,
@@ -1310,15 +1364,27 @@ def chat_with_user(state: AnalysisState) -> dict:
                 HumanMessage(content=answer_request),
             ]
         )
+        # 传给回答模型的内容包括：
+        # - 回答规则和更新后的研究条件。
+        # - 前面的聊天记录。
+        # - 本轮需要回答的“解释一下AQI是什么”。
 
         reply_parts.append(str(answer.content))
+        # 生成的回答追加进去：
+        # reply_parts = [
+        #     "年份已设为：2023。",
+        #     "AQI 是空气质量指数……",
+        # ]
+        # 只修改条件、没有问题时，这次回答模型调用就可以跳过。因此每轮不一定调用两次模型。
 
     if not reply_parts:
         answer = llm.invoke(
-            [answer_instruction, *state.get("messages", [])]
+            [answer_instruction, *state.get("messages", [])] # 取出已有聊天记录，没有时使用空列表。
+            # 把列表里的消息逐条展开。 # answer_instruction：本轮回答规则。
         )
         reply_parts.append(str(answer.content))
 
+    # 合成回答，返回本轮状态更新
     response = AIMessage(
         content="\n\n".join(reply_parts)
     )
@@ -1328,88 +1394,34 @@ def chat_with_user(state: AnalysisState) -> dict:
         "research_context": current_snapshot,
         "research_history": research_history,
     }
+# |     返回内容        |            后续作用 |
+# |--------------------|--------------------------------------|
+# | `messages`         | 新回答通过 `add_messages` 合并进聊天记录 |
+# | `research_context` | 保存本轮最新条件 |
+# | `research_history` | 保存更新后的历史快照列表 |
 
 
 
-# 终于要连图了！！耶耶耶
-builder = StateGraph(
+analysis_graph = build_analysis_graph(
     state_schema=AnalysisState,
+    nodes={
+        "inspect_files": inspect_files,
+        "identify_columns": identity_columns,
+        "ask_for_confirmation": ask_for_confirmation,
+        "revise_columns": revise_columns,
+        "extract_event_types": extract_event_types,
+        "select_event_type": select_event_type,
+        "validate_data": validate_data,
+        "explain_missing_data": explain_missing_data,
+        "match_and_calculate": match_and_calculate,
+        "summarize_results": summarize_results,
+        "generate_report": generate_report,
+    },
+    confirmation_router=route_confirmation,
+    validation_router=route_validation,
 )
-builder.add_node("inspect_files",       inspect_files,)
-builder.add_node("identify_columns",    identity_columns,)
-builder.add_node("ask_for_confirmation",ask_for_confirmation,)
-builder.add_node("revise_columns",      revise_columns,)
-builder.add_node("extract_event_types", extract_event_types,)
-builder.add_node("select_event_type",   select_event_type,)
-builder.add_node("validate_data",       validate_data,)
-builder.add_node("explain_missing_data",explain_missing_data,)
-builder.add_node("match_and_calculate", match_and_calculate,)
-builder.add_node("summarize_results",   summarize_results,)
-builder.add_node("generate_report",     generate_report,)
-
-builder.add_edge(
-    START,
-    "extract_event_types",
-)
-
-builder.add_edge(
-    "inspect_files",
-    "identify_columns")
-
-builder.add_edge(
-    "identify_columns",
-    "ask_for_confirmation")
-
-# ask_for_confirmation连接第一条条件边
-builder.add_conditional_edges(
-    "ask_for_confirmation",
-            route_confirmation,
-                   {
-                             "extract_event_types": "extract_event_types",
-                             "revise_columns": "revise_columns",
-                             },)
-builder.add_edge(
-    "revise_columns",
-    "ask_for_confirmation",)
-
-builder.add_edge(
-    "extract_event_types",
-    "select_event_type")
-
-builder.add_edge(
-    "select_event_type",
-    "validate_data")
-
-builder.add_conditional_edges(
-    "validate_data",
-    route_validation,
-    {
-        "select_event_type": "select_event_type",
-        "explain_missing_data": "explain_missing_data",
-        "match_and_calculate": "match_and_calculate",
-    },)
-
-builder.add_edge(
-    "explain_missing_data",
-    END)
-
-builder.add_edge(
-    "match_and_calculate",
-    "summarize_results",)
-
-builder.add_edge(
-    "summarize_results",
-    "generate_report",)
-
-builder.add_edge(
-    "generate_report",
-    END)
 
 
-
-analysis_graph = builder.compile(
-    checkpointer=InMemorySaver(),
-)
 
 chat_builder = StateGraph(AnalysisState)
 chat_builder.add_node("chat_with_user", chat_with_user)
@@ -1438,7 +1450,7 @@ if __name__ == "__main__":
             print("本次对话结束。")
             break
 
-        if user_input == " ":
+        if user_input == "":
             continue # 跳过本轮后面的代码，回到循环开头。这样就不会把空消息发给模型。
 
         result = graph.invoke(
