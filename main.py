@@ -26,6 +26,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from analysis_graph import build_analysis_graph
 
+from data_sources import (
+    EVENT_FILE_PATH,
+    COLUMN_MAPPING,
+    resolve_state_fips,
+)
+import re
+
 llm = ChatOllama(
     model="qwen3:1.7b", # 回答概念问题、进行普通对话
     temperature=0,
@@ -79,6 +86,62 @@ class ResearchFieldChange(BaseModel):
     value: str | int | None # value是设置成什么
 
 
+class ToolDecision(BaseModel):
+    reason: str = Field(
+        description=(
+            "简短说明用户在问什么，"
+            "以及全局事件类型列表是否足以回答。"
+        ),
+    )
+
+
+    # | 选择                    | 用途           |
+    # |---                     |---------------|
+    # | `list_weather_events`  | 查询全局事件类型 |
+    # | `query_weather_events` | 查询指定地区、年份的事件类型 |
+    # | `none`                 | 普通问答或暂不支持的请求 |
+    tool_name: Literal[
+        "list_weather_events",
+        "query_weather_events",
+        "none",
+    ] = Field(
+        description=(
+            "查询整个内置数据集的事件类型，"
+            "选择 list_weather_events；"
+            "查询指定地区、指定年份的事件类型，"
+            "选择 query_weather_events；"
+            "无需工具或当前工具无法处理的问题，选择 none。"
+        ),
+    )
+
+    event_names: list[str] = Field(
+        description=(
+            "用户要求检查的具体事件名称。"
+            "保留用户原文，不翻译、不猜测对应类型。"
+            "询问全部类型或不需要工具时，返回空列表。"
+        )
+    )
+
+    # query_region、query_year 是本次查询的参数，与保存研究条件是两个不同的动作。
+    query_region: str | None = Field(
+        description=(
+            "地区年份查询使用的地区。"
+            "优先使用本轮问题明确指定的地区；"
+            "本轮未指定时使用当前研究地区。"
+            "仍无法确定或选择其他工具时，返回 null。"
+        )
+    )
+
+    query_year: int | None = Field(
+        description=(
+            "地区年份查询使用的年份。"
+            "优先使用本轮问题明确指定的年份；"
+            "本轮未指定时使用当前研究年份。"
+            "仍无法确定或选择其他工具时，返回 null。"
+        )
+    )
+
+
 class ResearchAction(BaseModel):
     changes: list[ResearchFieldChange] # 可能一个问题里多个修改条件
 
@@ -87,6 +150,21 @@ class ResearchAction(BaseModel):
             "除修改条件外，本轮还需回答的问题或执行的请求。"
             "只修改条件时为 None；"
             "混合请求保留附带问题，不要回答它。"
+        ),
+    )
+
+    pending_query_action: Literal[
+        "keep",
+        "resume",
+        "cancel",
+    ] = Field(
+        default="keep",
+        description=(
+            "对待完成查询的操作。"
+            "用户补充所需条件并要求查询，或明确要求继续时，"
+            "返回 resume；"
+            "明确取消查询时返回 cancel；"
+            "普通问答、仅修改条件、没有待完成查询时返回 keep。"
         ),
     )
 
@@ -124,6 +202,7 @@ class AnalysisState(TypedDict, total=False):
     messages: Annotated[list[BaseMessage], add_messages] # 保存用户和助手的对话，聊天记录
     research_context: dict[str, str | int | None] # 把研究条件保存在图的会话状态里，当前生效的研究条件
     research_history: list[dict[str, str | int | None]] # 过去保存过的条件快照
+    pending_weather_query: str | None  # 保存等待补充参数的原始查询
 
     # 用户启用Agent时必须提供
     event_file_path: Required[str]
@@ -216,6 +295,99 @@ def extract_types(file_path: str, event_type_column: str)->set[str]:
 
     finally:
         workbook.close()
+
+# list_weather_events
+#     ↓ 使用内置路径和字段配置
+# extract_types
+#     ↓ 读取真实文件
+# 返回排序后的事件类型列表
+
+@tool
+def list_weather_events() -> list[str]:
+    """列出项目内置天气事件数据中的全部事件类型。
+
+    用于回答有哪些天气事件、支持查询哪些事件类型等问题。
+    返回整个内置数据集的类型列表，不按当前地区或年份筛选。
+    """
+    event_types = extract_types.invoke(
+        {
+            "file_path": str(EVENT_FILE_PATH), # 使用项目内部配置的文件，用户不用提供路径。
+            "event_type_column": COLUMN_MAPPING["event_type"], # 找到实际的事件类型列名
+        }
+    )
+
+    return sorted(event_types) # 把提取出的不重复类型排序，返回列表
+
+
+@tool
+def query_weather_events(region: str, year: int) -> dict:
+    """查询指定州、指定年份的天气事件类型。
+
+    按事件开始日期所在年份筛选。
+    返回匹配记录行数和不重复的事件类型。
+    当前地区支持范围由 resolve_state_fips 决定。
+    """
+    state_fips = resolve_state_fips(region)
+
+    if not 1 <= year <= 9999:
+        raise ValueError("年份必须在1至9999之间。")
+
+    state_column = COLUMN_MAPPING["event_state"]
+    start_column = COLUMN_MAPPING["start_time"]
+    type_column = COLUMN_MAPPING["event_type"]
+
+    event_data = pd.read_excel(
+        EVENT_FILE_PATH,
+        usecols=[
+            state_column,
+            start_column,
+            type_column,
+        ],
+    )
+
+    state_codes = normalize_fips(
+        event_data[state_column],
+        width=2,
+    )
+
+    region_data = event_data.loc[
+        state_codes == state_fips
+    ].copy()
+
+    start_dates = pd.to_datetime(
+        region_data[start_column],
+        errors="coerce",
+    )
+
+    invalid_date_count = int(start_dates.isna().sum())
+
+    if invalid_date_count > 0:
+        raise ValueError(
+            f"该地区有{invalid_date_count}条记录的开始日期"
+            "缺失或无法识别，暂不能可靠地按年份筛选。"
+        )
+
+    matched_data = region_data.loc[
+        start_dates.dt.year == year
+    ]
+
+    event_types = sorted(
+        {
+            str(value).strip()
+            for value in matched_data[type_column].dropna()
+            if str(value).strip()
+        }
+    )
+
+    return {
+        "region": region,
+        "state_fips": state_fips,
+        "year": year,
+        "year_basis": "事件开始日期所在年份",
+        "matched_row_count": len(matched_data),    # 匹配的数据行数
+        "event_types": event_types,
+        "event_type_count": len(event_types),      # 不重复的天气事件类型数
+    }
 
 
 def inspect_files(state: AnalysisState) -> dict[str, str]:
@@ -1095,6 +1267,136 @@ def generate_report(
     }
 
 
+EVENT_NAME_ALIASES = {
+    "龙卷风": "Tornado",
+    "暴雨": "Heavy Rain",
+    "强降雨": "Heavy Rain",
+    "冰雹": "Hail",
+    "野火": "Wildfire",
+    "森林火灾": "Wildfire",
+    "干旱": "Drought",
+    "暴雪": "Heavy Snow",
+    "雷暴大风": "Thunderstorm Wind",
+}
+
+# def choose_tool(question: str
+# 收到问题
+#     ↓
+# 4b模型判断是否需要全局事件类型列表
+#     ↓
+# 返回选择理由和工具名称
+def choose_tool(
+    question: str,
+    research_context: dict,
+) -> ToolDecision:
+    context_json = ResearchContext.model_validate(
+        research_context
+    ).model_dump_json()
+
+    instruction = SystemMessage(
+        content=(
+            """
+你负责选择工具并提取查询参数，不回答问题、不修改研究条件。
+
+工具说明：
+
+1. list_weather_events
+查询整个内置数据集的全部事件类型。
+适用于明确询问内置数据整体包含哪些类型，
+或内置数据整体是否包含某个类型。
+这类全局查询不使用当前研究地区和年份。
+
+2. query_weather_events
+查询指定地区、指定年份的事件类型。
+适用于询问某地某年的事件，
+或使用“当地”“这一年”“当前研究范围”等指代。
+仅支持州级地区和单个年份，
+不支持城市、月份、日期区间、事件次数或AQI计算。
+
+查询参数规则：
+- 问题明确指定的地区或年份优先。
+- 缺少的参数可以从当前研究条件继承。
+- 仍无法确定的参数返回 null，不猜测。
+- 即使参数不完整，仍可选择 query_weather_events，
+  程序随后会检查缺少什么。
+  
+当前研究年份为 null，且问题没有明确指定年份时，
+query_year 必须为 null，禁止使用示例中的年份。
+
+例：当前研究地区为得州，年份为 null。
+问题：当地有哪些天气事件类型？
+工具：query_weather_events
+query_region="得州"
+query_year=null
+
+3. none
+一般概念解释、单纯修改条件、
+AQI计算、实时天气，或超出上述工具能力的问题。
+
+event_names 规则：
+- 查询全部类型时返回 []。
+- 检查具体类型时，提取用户原文中的名称。
+- 每个名称必须是问题中连续出现的原文。
+- 不翻译、不增加前缀、冒号或解释。
+- 多个名称拆成独立元素。
+- 选择 none 时返回 []。
+
+选择 list_weather_events 或 none 时，
+query_region 和 query_year 都返回 null。
+
+示例：
+
+问题：内置数据有哪些天气事件类型？
+工具：list_weather_events
+event_names=[]
+query_region=null
+query_year=null
+
+问题：内置数据有没有冰雹和野火？
+工具：list_weather_events
+event_names=["冰雹", "野火"]
+query_region=null
+query_year=null
+
+问题：得州2023年有哪些天气事件类型？
+工具：query_weather_events
+event_names=[]
+query_region="得州"
+query_year=2023
+
+当前研究地区为得州、年份为2023时：
+问题：当地这一年有哪些天气事件类型？
+工具：query_weather_events
+event_names=[]
+query_region="得州"
+query_year=2023
+
+问题：得州有哪些天气事件类型？
+工具：query_weather_events
+query_region="得州"
+query_year 使用当前研究年份；没有则为 null。
+
+问题：AQI是什么意思？
+工具：none
+event_names=[]
+query_region=null
+query_year=null
+"""
+            + "\n当前研究条件：\n"
+            + context_json
+        )
+    )
+
+    router = context_llm.with_structured_output(ToolDecision)
+
+    return router.invoke(
+        [
+            instruction,
+            HumanMessage(content=question),
+        ]
+    )
+
+
 
     # 以user说的：当前研究2024年，用户说：“把年份改成2023年，顺便解释一下AQI是什么。” 为例子
 def chat_with_user(state: AnalysisState) -> dict:
@@ -1115,6 +1417,7 @@ def chat_with_user(state: AnalysisState) -> dict:
     # 读到这里的旧年份是 2024。model_validate() 按照我们定义的格式校验数据，
     # 这里的 current_context，后面一直代表本轮修改前的条件。
 
+    pending_weather_query = state.get("pending_weather_query")
     context_instruction = SystemMessage(
         content=(
                 """
@@ -1170,6 +1473,34 @@ def chat_with_user(state: AnalysisState) -> dict:
     """
                 + "\n当前条件："
                 + current_context.model_dump_json()
+                + "\n待完成的天气查询："
+                + str(pending_weather_query)
+                + """
+    处理待完成查询：
+    没有待完成查询时，pending_query_action="keep"。
+
+    有待完成查询时：
+    - “那就查2023年的”：提取年份修改，
+      pending_query_action="resume"，answer_request=null。
+    - “继续刚才的查询”：pending_query_action="resume"，
+      answer_request=null。
+    - “年份改成2023年，先别查”：只修改年份，
+      pending_query_action="keep"，answer_request=null。
+    - “AQI是什么意思”：正常保留概念问题，
+      pending_query_action="keep"。
+    - “不查了，取消刚才的查询”：pending_query_action="cancel"，
+      answer_request=null。
+
+    不要仅因为存在待完成查询就自动执行它。
+    
+    用户未指定年份时，不得补充年份，也不得使用示例中的年份。
+
+    例：研究得州的暴雨与臭氧AQI，先不分析。
+    {"changes":[{"field":"region","operation":"set","value":"得州"},
+    {"field":"event_description","operation":"set","value":"暴雨"},
+    {"field":"pollutant","operation":"set","value":"臭氧"}],
+    "answer_request":null,"pending_query_action":"keep"}
+    """
         )
     )
 
@@ -1192,7 +1523,16 @@ def chat_with_user(state: AnalysisState) -> dict:
     # }
     # 这一步只理解要求，还没有实际修改条件。
 
-    # Python 执行条件操作
+    latest_user_text = str(state["messages"][-1].content)
+
+    mentioned_years = {
+        int(value)
+        for value in re.findall(
+            r"(?<!\d)(\d{4})(?!\d)",
+            latest_user_text,
+        )
+    }
+
     merged_context = current_context.model_dump()
     update_notes = [] # 遇到无效值或找不到历史时，把原因放进 update_notes
     # 例子这里最终执行 merged_context["year"] = 2023
@@ -1210,6 +1550,14 @@ def chat_with_user(state: AnalysisState) -> dict:
 
             if field_name == "year":
                 valid_value = type(change.value) is int
+
+                if valid_value and change.value not in mentioned_years:
+                    update_notes.append(
+                        "本轮没有明确提供该数字年份，"
+                        "未执行模型提出的年份修改，保留原条件。"
+                    )
+                    continue
+
             else:
                 valid_value = (
                     isinstance(change.value, str)
@@ -1286,16 +1634,17 @@ def chat_with_user(state: AnalysisState) -> dict:
             "操作提示说明未执行成功时，不得声称操作已完成。"
             "如果这些条件与用户的明确要求冲突，请指出问题。"
             "关键条件有歧义时，提出简短澄清问题。"
-            "当前尚未接入数据查询、计算和联网工具。"
-            "可以解释一般概念，但不能声称已经查询数据、"
-            "完成计算或获取最新信息，也不能编造分析数字。"
+            "当前已接入查询内置数据集全部天气事件类型的工具。"
+            "只有本轮提供了工具查询结果，才能声称本轮查询过数据。"
+            "这个工具不支持按地区或年份筛选，也不能计算AQI或查询实时天气。"
+            "可以解释一般概念，但不能编造数据、计算结果或最新信息。"
             "不必每轮重复介绍能力限制。"
             "用户询问概念时，直接解释概念，"
             "不要强行联系当前研究，也不要添加未经验证的天气与污染关系。"
             "用户说先不分析时，简短确认保存的条件即可。"
             "项目已有内置历史数据，不要默认要求用户上传或提供数据。"
-            "目前工具尚未接入；用户要求实际计算时，"
-            "如实说明分析功能仍在接入，不要把功能缺失说成用户缺少数据。只提取最新一条用户消息要求的研究条件变更。"
+            "用户要求实际计算时，如实说明计算功能仍在接入，"
+            "不要把功能缺失说成用户缺少数据。"
             "已有条件是当前状态，历史对话只用于理解最新消息中的指代。"
             "例如，用户先指定2024年，后来改为2023年，"
             "最新消息说“改回最开始那个年份”，应该把年份更新为2024。"
@@ -1346,36 +1695,276 @@ def chat_with_user(state: AnalysisState) -> dict:
     # 有问题时，调用1.7b模型回答
     answer_request = action.answer_request
 
+    if action.pending_query_action == "cancel":
+        pending_weather_query = None
+        reply_parts.append("待完成的天气查询已取消。")
+
+    elif action.pending_query_action == "resume":
+        if pending_weather_query is not None:
+            if not answer_request:
+                answer_request = pending_weather_query
+        else:
+            reply_parts.append("当前没有待完成的天气查询。")
     if answer_request is not None and answer_request.strip() != "":
-        question_instruction = SystemMessage(
-            content=(
-                    answer_instruction.content
-                    + "\n条件操作的确认由程序单独提供。"
-                      "本次只回答用户的附带问题，不重复确认条件，"
-                      "也不要声称执行了新的条件修改。"
-            )
+
+        decision = choose_tool(
+            answer_request,
+            current_snapshot,
         )
 
+        if decision.tool_name == "query_weather_events":
+            explicit_years = {
+                int(value)
+                for value in re.findall(
+                    r"(?<!\d)(\d{4})(?!\d)",
+                    answer_request,
+                )
+            }
+
+            if len(explicit_years) == 1:
+                decision.query_year = next(iter(explicit_years))
+
+            elif not explicit_years:
+                decision.query_year = current_snapshot["year"]
+
+            else:
+                decision.query_year = None
+                reply_parts.append(
+                    "本轮包含多个年份，当前工具只支持单个年份查询。"
+                )
+
+        if decision.tool_name == "list_weather_events":
+            print("\n[工具] 正在读取内置天气事件类型……")
+
+            try:
+                event_types = list_weather_events.invoke({})
+
+                scope_text = (
+                    "查询范围：整个内置天气事件数据集，"
+                    "未按地区或年份筛选。"
+                )
+
+                if decision.event_names:
+                    type_lookup = {
+                        name.strip().casefold(): name  # 把文件里的真实类型整理成方便查询的字典
+                        for name in event_types
+                    }
+
+                    conclusions = []
+
+                    for requested_name in decision.event_names:
+                        cleaned_name = requested_name.strip()
+
+                        if cleaned_name.casefold() not in answer_request.casefold():
+                            reply_parts.append(
+                                "事件名称提取出现错误："
+                                f"“{cleaned_name}”不在本轮问题原文中。"
+                                "该名称未执行匹配，不能据此判断数据中是否存在。"
+                            )
+                            continue
+
+                        if cleaned_name.casefold() not in answer_request.casefold():
+                            reply_parts.append(
+                                "事件名称提取出现错误："
+                                f"“{cleaned_name}”不在本轮问题原文中。"
+                                "该名称未执行匹配，不能据此判断数据中是否存在。"
+                            )
+                            continue
+
+                        lookup_name = EVENT_NAME_ALIASES.get(
+                        # 查对应表：输入“龙卷风”就得到 "Tornado"；输入本来就是 "Tornado"，就保留原名。
+                            cleaned_name,
+                            cleaned_name,
+                        )
+                        # 用户问“有没有龙卷风”
+                        # → 模型提取“龙卷风”
+                        # → 对应表转换为 Tornado
+                        # → 在真实类型列表中匹配
+                        # → 输出“内置数据包含事件类型：Tornado”
+                        # 判断名称是否存在，并生成结论。
+                        matched_name = type_lookup.get(
+                        # 再去文件实际读出的类型列表里核对。casefold() 用于忽略英文大小写，
+                        # 因此 tornado 也能匹配 Tornado。
+                            lookup_name.casefold()
+                        )
+
+                        if matched_name is not None:
+                            conclusions.append(
+                                f"查询名称：{cleaned_name}。\n"
+                                f"内置数据包含事件类型：{matched_name}。"
+                            )
+                        else:
+                            conclusions.append(
+                                f"未找到与“{requested_name}”"
+                                "名称完全匹配的事件类型。"
+                                "这里只做名称匹配，"
+                                "尚未判断中文名称或同义词是否对应其他类型。"
+                            )
+
+                    reply_parts.append(
+                        "\n".join(conclusions) + "\n\n" + scope_text
+                    )
+
+                else: # 用户问全部类型时，由 Python 生成列表和数量。
+                    event_list = "\n".join(
+                        f"{index}. {name}"
+                        for index, name in enumerate(  # enumerate() 给类型编号
+                            event_types, start=1
+                        )
+                    )
+
+                    reply_parts.append(
+                        f"{scope_text}\n"
+                        f"共 {len(event_types)} 种，"
+                        "以下保留数据中的原始名称：\n\n"
+                        f"{event_list}"
+                    )
+
+            except (OSError, ValueError, KeyError) as error:
+                reply_parts.append(
+                    f"读取内置天气事件类型失败：{error}。"
+                    "本轮没有获得有效查询结果。"
+                )
+
+        elif decision.tool_name == "query_weather_events":
+            missing_fields = []
+
+            if not decision.query_region:
+                missing_fields.append("地区")
+
+            if decision.query_year is None:
+                missing_fields.append("年份")
+
+            if missing_fields:
+                pending_weather_query = answer_request
+
+                reply_parts.append(
+                    "这次查询还需要："
+                    + "、".join(missing_fields)
+                    + "。请补充后再查询。"
+                )
+
+            else:
+                print("\n[工具] 正在按地区和年份筛选天气事件……")
+
+                try:
+                    result = query_weather_events.invoke(
+                        {
+                            "region": decision.query_region,
+                            "year": decision.query_year,
+                        }
+                    )
+                    pending_weather_query = None
+
+                    scope_text = (
+                        f"查询地区：{result['region']}；"
+                        f"州代码：{result['state_fips']}。\n"
+                        f"查询年份：{result['year']}；"
+                        f"按{result['year_basis']}筛选。\n"
+                        f"匹配记录：{result['matched_row_count']}行；"
+                        f"事件类型：{result['event_type_count']}种。"
+                    )
+
+                    reply_parts.append(scope_text)
+
+                    if result["matched_row_count"] == 0:
+                        reply_parts.append(
+                            "内置数据中没有匹配该地区和年份的记录。"
+                            "这不代表现实中没有发生天气事件。"
+                        )
+
+                    elif decision.event_names:
+                        type_lookup = {
+                            name.casefold(): name
+                            for name in result["event_types"]
+                        }
+
+                        for requested_name in decision.event_names:
+                            cleaned_name = requested_name.strip()
+
+                            if (
+                                not cleaned_name
+                                or cleaned_name.casefold()
+                                not in answer_request.casefold()
+                            ):
+                                reply_parts.append(
+                                    f"事件名称“{requested_name}”"
+                                    "提取异常，未执行该名称的匹配。"
+                                )
+                                continue
+
+                            lookup_name = EVENT_NAME_ALIASES.get(
+                                cleaned_name,
+                                cleaned_name,
+                            )
+
+                            matched_name = type_lookup.get(
+                                lookup_name.casefold()
+                            )
+
+                            if matched_name is not None:
+                                reply_parts.append(
+                                    f"该查询范围内包含事件类型："
+                                    f"{matched_name}"
+                                    f"（查询名称：{cleaned_name}）。"
+                                )
+                            else:
+                                reply_parts.append(
+                                    f"该查询范围内未找到与"
+                                    f"“{cleaned_name}”对应的类型名称。"
+                                    "当前仅支持原名和已配置的中文别名匹配。"
+                                )
+
+                    else:
+                        event_list = "\n".join(
+                            f"{index}. {name}"
+                            for index, name in enumerate(
+                                result["event_types"],
+                                start=1,
+                            )
+                        )
+
+                        reply_parts.append(
+                            "以下保留数据中的原始名称：\n"
+                            + event_list
+                        )
+
+                except (OSError, ValueError, KeyError) as error:
+                    reply_parts.append(
+                        f"按地区和年份查询失败：{error}。"
+                        "本轮未获得有效查询结果。"
+                    )
+
+        else:
+            question_instruction = SystemMessage(
+                content=(
+                        answer_instruction.content
+                        + "\n条件操作的确认由程序单独提供。"
+                          "本次只回答用户的问题，不重复确认条件。"
+                          "本轮没有执行数据查询工具。"
+                )
+            )
+
         # 例子的问题这里本轮有附带问题，所以进入：
-        answer = llm.invoke(
-            [
+            answer = llm.invoke(
+                [
                 question_instruction,
                 *state.get("messages", [])[:-1],
                 HumanMessage(content=answer_request),
-            ]
-        )
-        # 传给回答模型的内容包括：
-        # - 回答规则和更新后的研究条件。
-        # - 前面的聊天记录。
-        # - 本轮需要回答的“解释一下AQI是什么”。
+                ]
+            )
+             # 传给回答模型的内容包括：
+             # - 回答规则和更新后的研究条件。
+             # - 前面的聊天记录。
+             # - 本轮需要回答的“解释一下AQI是什么”。
 
-        reply_parts.append(str(answer.content))
-        # 生成的回答追加进去：
-        # reply_parts = [
-        #     "年份已设为：2023。",
-        #     "AQI 是空气质量指数……",
-        # ]
-        # 只修改条件、没有问题时，这次回答模型调用就可以跳过。因此每轮不一定调用两次模型。
+            reply_parts.append(str(answer.content))
+            # 生成的回答追加进去：
+            # reply_parts = [
+            #     "年份已设为：2023。",
+            #     "AQI 是空气质量指数……",
+            # ]
+    # 只修改条件、没有问题时，这次回答模型调用就可以跳过。因此每轮不一定调用两次模型。
 
     if not reply_parts:
         answer = llm.invoke(
@@ -1393,6 +1982,7 @@ def chat_with_user(state: AnalysisState) -> dict:
         "messages": [response],
         "research_context": current_snapshot,
         "research_history": research_history,
+        "pending_weather_query": pending_weather_query,
     }
 # |     返回内容        |            后续作用 |
 # |--------------------|--------------------------------------|
@@ -1432,6 +2022,7 @@ chat_builder.add_edge("chat_with_user", END)
 graph = chat_builder.compile(
     checkpointer=InMemorySaver(),
 )
+
 
 # 第一次invoke
 if __name__ == "__main__":

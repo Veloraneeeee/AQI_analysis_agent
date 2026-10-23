@@ -26,6 +26,28 @@ COLUMN_MAPPING = {
     ],
 }
 
+# 字典：记录地区叫法与州代码的对应关系
+REGION_STATE_FIPS = {
+    "得州": "48",
+    "德州": "48",
+    "德克萨斯州": "48",
+    "texas": "48",
+    "tx": "48",
+}
+
+# 函数：去掉首尾空格、统一英文大小写，再查对应关系。无法识别时明确报错，避免意外查询整个数据集。
+def resolve_state_fips(region: str) -> str:
+    normalized_region = region.strip().casefold()
+
+    state_fips = REGION_STATE_FIPS.get(normalized_region)
+
+    if state_fips is None:
+        raise ValueError(
+            f"暂不支持地区“{region}”，当前支持得州及其别名。"
+        )
+
+    return state_fips
+
 if __name__ == "__main__":
     import pandas as pd
 
