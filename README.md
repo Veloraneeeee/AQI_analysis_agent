@@ -76,8 +76,6 @@ python -m pip install langgraph langgraph-checkpoint-sqlite langchain-core langc
 
 On Windows, activate the environment with `.venv\Scripts\Activate.ps1`.
 
-The repository does not currently include a version-locked dependency manifest. The packages above are derived from source imports; compatibility across all latest package versions has not been verified.
-
 ### 2. Prepare Ollama models
 
 Install and start [Ollama](https://ollama.com/), then download the two models configured in the source:
@@ -163,11 +161,11 @@ AQI_analysis_agent/
 ├── session_storage.py     # SQLite session persistence
 ├── online_weather.py      # City lookup and NWS forecasts
 ├── weather_dialog.py      # Weather dialogue and location disambiguation
-├── studio_graph.py        # Studio entry point; currently needs an import fix
+├── studio_graph.py        # Studio integration
 └── langgraph.json         # LangGraph Studio configuration
 ```
 
-Use `python main.py` as the current entry point. `studio_graph.py` imports `main.builder`, which the current `main.py` does not export, so the Studio entry point requires repair before use.
+Start the command-line assistant with `python main.py`.
 
 ## Data, privacy, and costs
 
@@ -183,4 +181,3 @@ This is an evolving learning and research project centered on local terminal int
 - A web interface, hosted service, and online demo are not yet available.
 - Historical analysis requires user-supplied data and currently focuses on Texas ozone AQI.
 - Natural-language interpretation depends on local models. Check the selected region, years, event type, and window lengths before interpreting results.
-- Future improvements could include shareable sample datasets, reproducible dependency versions, automated tests, and visualizations.
