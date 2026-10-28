@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Local datasets
+data/
+
+# Local session database
+runtime/*.sqlite
+runtime/*.sqlite-*
+runtime/*.db
+
+# Merge tool temporary files
+*_BACKUP_*.py
+*_BASE_*.py
+*_LOCAL_*.py
+*_REMOTE_*.py

@@ -27,6 +27,7 @@ COLUMN_MAPPING = {
 }
 
 # 字典：记录地区叫法与州代码的对应关系
+# 把用户的地区名称转换成数据里的代码
 REGION_STATE_FIPS = {
     "得州": "48",
     "德州": "48",
@@ -36,7 +37,7 @@ REGION_STATE_FIPS = {
 }
 
 # 函数：去掉首尾空格、统一英文大小写，再查对应关系。无法识别时明确报错，避免意外查询整个数据集。
-def resolve_state_fips(region: str) -> str:
+def resolve_state_fips(region: str) -> str: # 负责查表
     normalized_region = region.strip().casefold()
 
     state_fips = REGION_STATE_FIPS.get(normalized_region)
