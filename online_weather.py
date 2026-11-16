@@ -4,18 +4,20 @@ from urllib.parse import urlsplit
 import httpx
 
 
+# 输入一个美国地点的经纬度，调用 NOAA National Weather Service API，
+# 返回这个地点未来的天气预报
 def get_nws_forecast(latitude: float, longitude: float) -> dict:
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         raise ValueError("经纬度超出有效范围。")
 
-    point_url = (
+    point_url = ( # 准备向 NWS（美国国家气象局）发送请求的 API 地址
         f"https://api.weather.gov/points/"
         f"{latitude:.4f},{longitude:.4f}"
     )
 
     headers = {
         "User-Agent": "AQIResearchAssistant/0.2",
-        "Accept": "application/geo+json",
+        "Accept": "application/geo+json", # 告诉服务器你想收到什么格式的数据
     }
 
     try:
@@ -24,7 +26,7 @@ def get_nws_forecast(latitude: float, longitude: float) -> dict:
             timeout=15.0,
         ) as client:
             point_response = client.get(point_url)
-            point_response.raise_for_status()
+            point_response.raise_for_status() # 检查 HTTP 响应状态
 
             point_properties = point_response.json()["properties"]
             forecast_url = point_properties.get("forecast")
@@ -44,7 +46,7 @@ def get_nws_forecast(latitude: float, longitude: float) -> dict:
 
             forecast_response = client.get(
                 forecast_url,
-                params={"units": "si"},
+                params={"units": "si"}, # params 是用来添加 URL 查询参数
             )
             forecast_response.raise_for_status()
 
@@ -55,7 +57,7 @@ def get_nws_forecast(latitude: float, longitude: float) -> dict:
             f"NWS联网请求失败：{error}"
         ) from error
 
-    periods = properties.get("periods") or []
+    periods = properties.get("periods") or [] # periods 是天气预报的时间段列表
 
     if not periods:
         raise ValueError("NWS返回的预报时段为空。")
@@ -64,13 +66,13 @@ def get_nws_forecast(latitude: float, longitude: float) -> dict:
         "provider": "NOAA / National Weather Service",
         "latitude": latitude,
         "longitude": longitude,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "forecast_updated_at": properties.get("updateTime"),
-        "valid_from": periods[0]["startTime"],
-        "valid_until": periods[-1]["endTime"],
+        "fetched_at": datetime.now(timezone.utc).isoformat(), # AQI Agent 获取天气数据的时间
+        "forecast_updated_at": properties.get("updateTime"), # NWS 更新这份天气预报的时间
+        "valid_from": periods[0]["startTime"], # 这份预报覆盖的开始时间
+        "valid_until": periods[-1]["endTime"], # 这份预报覆盖的结束时间
         "point_source_url": point_url,
         "forecast_source_url": str(forecast_response.url),
-        "periods": [
+        "periods": [ # 本质上它是一个列表推导式
             {
                 "name": period["name"],
                 "start_time": period["startTime"],
@@ -102,13 +104,13 @@ def search_us_cities(
 
     state_name = state_name.strip() if state_name else None
 
-    query = (
+    query = ( # 构造城市搜索关键词query
         f"{city_name}, {state_name}"
         if state_name
         else city_name
     )
 
-    search_limit = 10
+    search_limit = 10 # 最多请求 10 条地理搜索结果。
 
     try:
         response = httpx.get(
@@ -168,6 +170,7 @@ def get_city_forecast(
     state_name: str | None = None,
     city_id: int | None = None,
 ) -> dict:
+
     search = search_us_cities(city_name, state_name)
     candidates = search["candidates"]
 
@@ -189,7 +192,7 @@ def get_city_forecast(
         }
 
     if city_id is not None:
-        location = next(
+        location = next( # 从符合条件的候选中取出第一个匹配 city_id 的城市
             (
                 item
                 for item in candidates
@@ -211,7 +214,7 @@ def get_city_forecast(
 
     else:
         return {
-            **source_info,
+            **source_info, # 字典解包，把之前保存的城市查询来源信息合并到最终结果中。
             "status": "choose_location",
             "candidates": candidates,
             "may_be_truncated": search["may_be_truncated"],

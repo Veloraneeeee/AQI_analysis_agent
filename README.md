@@ -152,6 +152,7 @@ Named sessions are stored locally in `runtime/sessions.sqlite`. Temporary conver
 ```text
 AQI_analysis_agent/
 ├── main.py                # Conversation agent, tool selection, and CLI entry point
+├── uploaded_file_analysis.py # Uploaded-file inspection, column confirmation, and analysis nodes
 ├── analysis_graph.py      # LangGraph analysis workflow builder
 ├── aqi_analysis.py        # Windows, monitor matching, and annual comparisons
 ├── data_sources.py        # Dataset paths, column mappings, and region aliases
@@ -181,3 +182,8 @@ This is an evolving learning and research project centered on local terminal int
 - A web interface, hosted service, and online demo are not yet available.
 - Historical analysis requires user-supplied data and currently focuses on Texas ozone AQI.
 - Natural-language interpretation depends on local models. Check the selected region, years, event type, and window lengths before interpreting results.
+
+## Regression tests
+
+Run `python -m unittest discover -s tests -v` after installing the dependencies.
+Tests use temporary datasets and mocked model responses; Ollama and historical datasets are not required.

@@ -2,8 +2,9 @@ from typing import Literal
 
 from langchain_core.tools import tool
 
+# 整个文件就是让 Agent 知道之前做过哪些分析，再按需读取其中一份结果，不重新读 Excel、计算 AQI。
 
-def saved_result_headers(records: list[dict]) -> list[dict]:
+def saved_result_headers(records: list[dict]) -> list[dict]: # 提取记录目录
     return [
         {
             "record_id": record["record_id"],
@@ -16,7 +17,7 @@ def saved_result_headers(records: list[dict]) -> list[dict]:
 
 
 @tool
-def read_saved_analysis(
+def read_saved_analysis( # 读取指定记录
     records: list[dict],
     record_id: str | None = None,
     view: Literal["summary", "coverage"] = "summary",
@@ -41,7 +42,8 @@ def read_saved_analysis(
     if record is None:
         return "本会话中没有找到指定的分析记录，请核对记录ID。"
 
-    parameters = record["parameters"]
+    # 取出分析条件和结果，准备文字列表
+    parameters = record["parameters"] # 当时用什么条件分析
     result = record["result"]
 
     lines = [
@@ -53,7 +55,7 @@ def read_saved_analysis(
         f"结束后{parameters['after_days']}天。",
     ]
 
-    is_comparison = "baseline" in result and "target" in result
+    is_comparison = "baseline" in result and "target" in result # 判断是单年分析，还是跨年比较
 
     annual_results = (
         [
@@ -74,12 +76,12 @@ def read_saved_analysis(
             f"匹配{total}条，完整比较{complete}条。"
         )
 
-        if view == "coverage":
-            excluded = annual["excluded_non_county_rows"]
-            no_monitor = annual["rows_without_monitor"]
-            incomplete = annual["rows_without_complete_window"]
+        if view == "coverage": # `coverage` 模式额外解释筛选过程，它把不能参与比较的事件分成三类
+            excluded = annual["excluded_non_county_rows"] #非县级事件，不能直接按县匹配。
+            no_monitor = annual["rows_without_monitor"] # 县级事件，但没有同县 AQI 站点。
+            incomplete = annual["rows_without_complete_window"] # 有同县站点，但没有任何站点满足完整前后窗口。
 
-            if total != excluded + no_monitor + incomplete + complete:
+            if total != excluded + no_monitor + incomplete + complete: # 然后验证数量是否对齐
                 lines.append(
                     "记录中的筛选数量未能对齐，"
                     "不能据此完整解释筛选过程。"
@@ -95,7 +97,7 @@ def read_saved_analysis(
                     ]
                 )
 
-        change_text = (
+        change_text = ( # 格式化变化量
             "无法计算"
             if change is None
             else f"{change:+.4f}点"
@@ -103,8 +105,8 @@ def read_saved_analysis(
 
         lines.append(f"平均事件前后变化量：{change_text}。")
 
-    if is_comparison:
-        difference = result["change_difference"]
+    if is_comparison: # 跨年记录再显示年份间差值
+        difference = result["change_difference"] # 目标年平均前后变化量 − 基准年平均前后变化量
 
         difference_text = (
             "无法计算"

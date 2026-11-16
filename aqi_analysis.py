@@ -5,6 +5,8 @@ from data_sources import (
     AQI_FILE_PATH,
     COLUMN_MAPPING,
     resolve_state_fips,
+    read_table,
+    normalize_fips,
 )
 
 from data_cache import read_cached_excel
@@ -67,7 +69,7 @@ def compare_monitor_windows(
         }
     ).dropna(subset=["date", "aqi"])
 
-    daily_aqi = daily_data.groupby("date")["aqi"].median()
+    daily_aqi = daily_data.groupby("date")["aqi"].median() # 同站同日多条记录取 .median()
 
     before_dates = pd.date_range(
         windows["before_start"],
@@ -89,13 +91,13 @@ def compare_monitor_windows(
     after_complete = bool(after_values.notna().all())
 
     before_mean = (
-        float(before_values.mean())
+        float(before_values.mean()) # 前、后窗口分别取 .mean()
         if before_complete
         else None
     )
 
     after_mean = (
-        float(after_values.mean())
+        float(after_values.mean()) # 前、后窗口分别取 .mean()
         if after_complete
         else None
     )
@@ -359,7 +361,7 @@ def analyze_event_windows(
         flush=True,
     )
 
-    print("[分析 2/3] 正在准备臭氧AQI数据……", flush=True)
+    print("[分析 2/3] 正在准备AQI数据……", flush=True)
 
     region_aqi = load_region_aqi(region)
 
@@ -402,7 +404,7 @@ def analyze_event_windows(
         ]
 
         event_mean_change = (
-            sum(valid_changes) / len(valid_changes)
+            sum(valid_changes) / len(valid_changes) # 同一事件内，各完整站点变化取平均
             if valid_changes
             else None
         )
@@ -428,7 +430,7 @@ def analyze_event_windows(
         )
 
     overall_change = (
-        sum(event_mean_changes) / len(event_mean_changes)
+        sum(event_mean_changes) / len(event_mean_changes) # 同一事件内，各完整站点变化取平均
         if event_mean_changes
         else None
     )
@@ -549,6 +551,422 @@ def compare_event_years(
             "减去基准年份的平均前后变化量"
         ),
     }
+
+
+
+# |           分析步骤        | 事件前后窗口分析                   | 开始日／结束日分析         |
+# |--------------------------|---------------------------------|-------------------------|
+# | 同一监测站、同一天有多条 AQI | 中位数，合成当天一个值              | 中位数，合成当天一个值     |
+# | 每个站的变化量             | 后窗口平均值 − 前窗口平均值          | 结束当天值 − 开始当天值    |
+# | 同一事件涉及多个完整站点     | 对站点变化量取平均值                | 保留各站比较记录          |
+# | 最终汇总                  | 先得到各事件平均变化，再对事件取平均值 | 对所有事件—站点变化取中位数 |
+
+
+
+# 上传文件的开始日/结束日比较；与上面的前后窗口分析保持不同口径。
+def analyze_event_aqi(
+    event_file_path: str,
+    aqi_file_path: str,
+    column_mapping: dict[str, str | list[str] | None],
+    select_event_type: str,
+) -> list[dict]:
+
+    # 列出AQI文件需要读取的字段
+    monitor_site_columns = column_mapping["monitor_site_id"]
+    if not isinstance(monitor_site_columns, list):
+        raise ValueError(
+            "monitor_site_id 应包含列的列表。."
+        )
+
+
+    aqi_columns = [
+        column_mapping["aqi_date"],
+        column_mapping["aqi_value"],
+        column_mapping["monitor_state"],
+        column_mapping["monitor_county"],
+    ] + monitor_site_columns
+    aqi_columns = list(dict.fromkeys(aqi_columns)) # monitor_site_id 中可能已经包含州和县字段，需要去重
+
+    aqi_data = read_table(
+        aqi_file_path,
+        aqi_columns,
+    )
+
+    # 读取天气事件表
+    event_columns = [
+        column_mapping["event_type"],
+        column_mapping["start_time"],
+        column_mapping["end_time"],
+        column_mapping["event_state"],
+        column_mapping["event_county"],
+        column_mapping["event_location_type"],
+    ]
+
+    if not all( # 这些值理论上都应该是列名字符串
+        isinstance(column, str)
+        for column in event_columns
+    ):
+        raise ValueError(
+            "天气事件文件的必要列没有被正确识别。"
+        )
+
+    event_columns = [
+        column
+        for column in event_columns
+        if isinstance(column, str)
+    ]
+
+    event_data = read_table( # match_and_calculate 中应该同时存在：event_data，aqi_data
+        event_file_path,
+        event_columns,
+    )
+
+    # 下一步只筛选用户选择的事件类型
+    event_type_column = column_mapping["event_type"]
+
+    if not isinstance(event_type_column, str):
+        raise ValueError(
+            "event_type 没有对应到有效的列名。"
+        )
+
+    selected_events = event_data[ # event_data 中筛选用户选择的事件类型。
+        event_data[event_type_column] # 取得事件类型整列
+        .astype(str)
+        .str.strip() # 把值转换为字符串并去掉首尾空格
+        == select_event_type
+        ].copy()
+
+    if selected_events.empty: # 检查是否真的筛到了数据
+        raise ValueError(
+            f"没有找到事件类型：{select_event_type}"
+        )
+
+#    event_data
+#    → 包含全部天气事件
+#    selected_events
+#    → 只包含用户选中的天气事件
+
+
+    # 现在统一事件的开始和结束日期。不要覆盖原始列，创建两个内部使用的新列。
+    start_time_column = column_mapping["start_time"]
+    end_time_column = column_mapping["end_time"]
+
+    if not isinstance(start_time_column, str):
+        raise ValueError(
+            "start_time 没有对应到有效的列名。"
+        )
+
+    if not isinstance(end_time_column, str):
+        raise ValueError(
+            "end_time 没有对应到有效的列名。"
+        )
+
+#   转换日期：
+    selected_events["_start_date"] = pd.to_datetime(
+        selected_events[start_time_column],
+        errors="coerce", # 表示无法识别的日期会变成 NaT，而不是让程序崩溃。
+    ).dt.normalize() # 会去掉具体时分秒，只保留当天
+
+    selected_events["_end_date"] = pd.to_datetime(
+        selected_events[end_time_column],
+        errors="coerce",
+    ).dt.normalize()
+
+    selected_events = selected_events.dropna( # 删除无法识别日期的事件
+        subset=["_start_date", "_end_date"]
+    )
+
+    if selected_events.empty:
+        raise ValueError(
+            "所选事件没有可用的开始和结束日期。"
+        )
+
+#   下一步处理 AQI 表里的日期和 AQI 数值
+    event_location_type_column = column_mapping[
+        "event_location_type"
+    ]
+
+    if not isinstance(event_location_type_column, str):
+        raise ValueError(
+            "event_location_type 没有对应到有效的列名。"
+        )
+
+    # 只保留县级事件
+    selected_events = selected_events[
+        selected_events[event_location_type_column]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        == "C"
+        ].copy()
+
+    # 如果用户选择的事件没有县级记录
+    if selected_events.empty:
+        raise ValueError(
+            "所选事件没有可以按县匹配的记录。"
+        )
+
+#   下一步处理 AQI 表里的日期和 AQI 数值，先取得对应列名
+    aqi_date_column = column_mapping["aqi_date"]
+    aqi_value_column = column_mapping["aqi_value"]
+
+    if not isinstance(aqi_date_column, str):
+        raise ValueError(
+            "aqi_date 没有对应到有效的列名。"
+        )
+
+    if not isinstance(aqi_value_column, str):
+        raise ValueError(
+            "aqi_value 没有对应到有效的列名。"
+        )
+
+#   把日期转换成和事件日期相同的格式
+    aqi_data["_aqi_date"] = pd.to_datetime(
+        aqi_data[aqi_date_column],
+        errors="coerce",
+    ).dt.normalize()
+
+#   把 AQI 转换成数字
+    aqi_data["_aqi_value"] = pd.to_numeric(
+        aqi_data[aqi_value_column],
+        errors="coerce",
+    )
+
+    aqi_data = aqi_data.dropna(
+        subset=["_aqi_date", "_aqi_value"]
+    )
+
+    if aqi_data.empty:
+        raise ValueError(
+            "AQI 文件中没有可用的日期和 AQI 数值。"
+        )
+
+    #   在匹配州和县之前，需要补一个字段：天气事件表里的县代码只有在 CZ_TYPE = "C" 时才能当作县代码使用
+
+
+    # 这一步统一州和县代码的格式，州代码补成两位、县代码补成三位。
+    # 取得四个地点列
+    event_state_column = column_mapping["event_state"]
+    event_county_column = column_mapping["event_county"]
+    monitor_state_column = column_mapping["monitor_state"]
+    monitor_county_column = column_mapping["monitor_county"]
+
+    # 检查它们都是字符串
+    location_columns = [
+        event_state_column,
+        event_county_column,
+        monitor_state_column,
+        monitor_county_column,
+    ]
+
+    if not all(
+            isinstance(column, str)
+            for column in location_columns
+    ):
+        raise ValueError(
+            "州或县字段没有被正确识别。"
+        )
+
+    # 创建统一后的匹配列
+    selected_events["_state_code"] = normalize_fips(
+        selected_events[event_state_column],
+        width=2,
+    )
+
+    selected_events["_county_code"] = normalize_fips(
+        selected_events[event_county_column],
+        width=3,
+    )
+
+    # AQI 表
+    aqi_data["_state_code"] = normalize_fips(
+        aqi_data[monitor_state_column],
+        width=2,
+    )
+
+    aqi_data["_county_code"] = normalize_fips(
+        aqi_data[monitor_county_column],
+        width=3,
+    )
+
+    # 最后删除地点代码无法识别的记录
+    selected_events = selected_events.dropna(
+        subset=["_state_code", "_county_code"]
+    )
+
+    aqi_data = aqi_data.dropna(
+        subset=["_state_code", "_county_code"]
+    )
+# 现在两张表都拥有统一的：
+    # _state_code
+    # _county_code
+
+    # 接下来把 AQI 数据整理成“每个监测站每天一条记录”，避免同一站点同一天有重复行。
+
+    # 1. 创建监测站 ID
+    aqi_data["_monitor_site_id"] = (
+        aqi_data[monitor_site_columns]
+        .astype("string")
+        .fillna("")
+        .agg("|".join, axis=1)
+    )
+
+    # 2. 处理同站同日重复记录
+    daily_aqi = (
+        aqi_data
+        .groupby(
+            [
+                "_state_code",
+                "_county_code",
+                "_monitor_site_id",
+                "_aqi_date",
+            ],
+            as_index=False,
+        )["_aqi_value"]
+        .median() # 这里使用中位数处理同一监测站同一天的重复 AQI 记录。
+    )
+
+
+    # 下一步把selected_events 的 _start_date
+    # 与：
+    # daily_aqi 的 _aqi_date
+    # 按同州、同县匹配，从而得到每个监测站的 start_aqi。
+    # 1. 给每场事件一个内部 ID
+    selected_events = selected_events.reset_index(drop=True)
+    selected_events["_event_row_id"] = selected_events.index
+
+    # 2. 按州、县和开始日期匹配 AQI
+    start_matches = selected_events.merge(
+        daily_aqi,
+        left_on=[
+            "_state_code",
+            "_county_code",
+            "_start_date",
+        ],
+        right_on=[
+            "_state_code",
+            "_county_code",
+            "_aqi_date",
+        ],
+        how="inner",
+    )
+
+    # 3. 把开始当天的 AQI 改名
+    start_matches = start_matches.rename(
+        columns={
+            "_aqi_value": "start_aqi",
+        }
+    )
+
+    start_matches = start_matches.drop( # 删除已经完成匹配的 AQI 日期列
+        columns=["_aqi_date"]
+    )
+
+    if start_matches.empty: # 检查是否存在匹配结果
+        raise ValueError(
+            "没有找到事件开始当天对应的 AQI 记录。"
+        )
+
+    # 用同一个监测站和 _end_date 再匹配一次，取得 end_aqi
+    end_aqi_data = daily_aqi.rename( # 1.准备结束日 AQI 数据
+        columns={
+            "_aqi_date": "_end_aqi_date",
+            "_aqi_value": "end_aqi",
+        }
+    )
+
+    matched_events = start_matches.merge( # 2. 按地点、监测站和结束日期匹配
+        end_aqi_data,
+        left_on=[
+            "_state_code",
+            "_county_code",
+            "_monitor_site_id",
+            "_end_date",
+        ],
+        right_on=[
+            "_state_code",
+            "_county_code",
+            "_monitor_site_id",
+            "_end_aqi_date",
+        ],
+        how="inner",
+    )
+
+    matched_events = matched_events.drop( # 3. 删除辅助日期列
+        columns=["_end_aqi_date"]
+    )
+
+    if matched_events.empty:
+        raise ValueError(
+            "没有找到同一监测站在事件开始和结束当天的完整 AQI 记录。"
+        )
+
+    matched_events["aqi_change"] = ( # 4. 计算 AQI 变化
+            matched_events["end_aqi"]
+            - matched_events["start_aqi"]
+    )
+
+#   给每条匹配结果标记趋势，并转换成 State 可以保存的记录列表
+    # 1.定义升降判断def classify_trend。
+    # 2.给每条结果添加趋势
+    matched_events["trend"] = (
+        matched_events["aqi_change"]
+        .apply(classify_trend)
+    )
+    # 3.创建统一的输出字段
+    matched_events["event_type"] = select_event_type
+
+    matched_events["start_date"] = (
+        matched_events["_start_date"]
+        .dt.strftime("%Y-%m-%d")
+    )
+
+    matched_events["end_date"] = (
+        matched_events["_end_date"]
+        .dt.strftime("%Y-%m-%d")
+    )
+
+    # 4. 只保留最终需要的数据
+    result_columns = [
+        "_event_row_id",
+        "event_type",
+        "_state_code",
+        "_county_code",
+        "_monitor_site_id",
+        "start_date",
+        "end_date",
+        "start_aqi",
+        "end_aqi",
+        "aqi_change",
+        "trend",
+    ]
+         # 转换成 list[dict】
+    aqi_changes = (
+        matched_events[result_columns]
+        .rename(
+            columns={
+                "_event_row_id": "event_id",
+                "_state_code": "state_code",
+                "_county_code": "county_code",
+                "_monitor_site_id": "monitor_site_id",
+            }
+        )
+        .to_dict(orient="records")
+    )
+
+    # 最后保持 node 的返回值：
+    return aqi_changes
+
+
+def classify_trend(aqi_change: float) -> str:
+    if aqi_change > 0:
+        return "increased"
+
+    if aqi_change < 0:
+        return "decreased"
+
+    return "unchanged"
+
 
 
 if __name__ == "__main__":
